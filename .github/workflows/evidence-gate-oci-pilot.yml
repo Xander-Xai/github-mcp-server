@@ -13,6 +13,7 @@ env:
   TRIVY_ARCHIVE_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
   TRIVY_EXECUTABLE_SHA256: d89bcc6510a267f11b773398cbf1be5520ce39f9e8b6633178c4487f05b7d791
   OCI_REF: ghcr.io/github/github-mcp-server@sha256:a44e77b9c9003ed0e228716d118aa4ce9f3418dce30fe2340c71553164bd96f0
+  OCI_TAG: ghcr.io/github/github-mcp-server:v1.12.2
   OCI_INDEX_DIGEST: sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6
 
 jobs:
@@ -54,6 +55,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          docker buildx imagetools inspect --raw "$OCI_TAG" > "$RUNNER_TEMP/index.json"
+          python - <<'PY'
+          import json, os
+          idx=json.load(open(os.environ['RUNNER_TEMP']+'/index.json'))
+          assert idx.get('mediaType') in {'application/vnd.oci.image.index.v1+json','application/vnd.docker.distribution.manifest.list.v2+json'}
+          assert idx.get('manifests')
+          assert any(d.get('digest')==os.environ['OCI_REF'].split('@',1)[1] and d.get('platform',{}).get('os')=='linux' and d.get('platform',{}).get('architecture')=='amd64' for d in idx['manifests'])
+          assert os.environ['OCI_INDEX_DIGEST']
+          PY
           mkdir -p "$RUNNER_TEMP/oci-out" "$RUNNER_TEMP/oci-out-repeat"
           (cd "$RUNNER_TEMP/producer" && python -m src.oci_producer --trivy "$RUNNER_TEMP/trivy" --image "$OCI_REF" --platform-os linux --platform-arch amd64 --out "$RUNNER_TEMP/oci-out")
           (cd "$RUNNER_TEMP/producer" && python -m src.oci_producer --trivy "$RUNNER_TEMP/trivy" --image "$OCI_REF" --platform-os linux --platform-arch amd64 --out "$RUNNER_TEMP/oci-out-repeat")
@@ -63,12 +73,12 @@ jobs:
           a=Path(os.environ['RUNNER_TEMP'])/'oci-out'; b=Path(os.environ['RUNNER_TEMP'])/'oci-out-repeat'
           def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
           ia=json.loads((a/'oci-identity.json').read_text()); ib=json.loads((b/'oci-identity.json').read_text())
-          assert ia['root']['digest']==os.environ['OCI_INDEX_DIGEST']
+          assert ia['root']['digest']==os.environ['OCI_REF'].split('@',1)[1]
           assert ia['selected']['platform']=={'os':'linux','architecture':'amd64'}
           assert ia['selected']['manifest_digest']==ib['selected']['manifest_digest']
           assert sha(a/'oci.manifest.json')==sha(b/'oci.manifest.json')
           assert json.loads((a/'evidence.json').read_text())['scanner_execution']['completeness_status']=='complete'
-          json.dump({'artifact':os.environ['OCI_REF'],'index_digest':ia['root']['digest'],'platform_manifest_digest':ia['selected']['manifest_digest'],'platform':ia['selected']['platform'],'manifest_sha256':sha(a/'oci.manifest.json'),'reproducible':True},open(Path(os.environ['RUNNER_TEMP'])/'pilot-summary.json','w'),indent=2)
+          json.dump({'artifact':os.environ['OCI_REF'],'index_digest':os.environ['OCI_INDEX_DIGEST'],'platform_manifest_digest':ia['selected']['manifest_digest'],'platform':ia['selected']['platform'],'manifest_sha256':sha(a/'oci.manifest.json'),'reproducible':True,'platform_verified_by_tag_index':True},open(Path(os.environ['RUNNER_TEMP'])/'pilot-summary.json','w'),indent=2)
           PY
           set +e
           node "$RUNNER_TEMP/core/dist/cli.js" verify --receipt "$RUNNER_TEMP/oci-out/receipt.json" --artifact "$RUNNER_TEMP/oci-out/oci.manifest.json" --evidence "$RUNNER_TEMP/oci-out/evidence.json" --policy strict-scanner-completeness --format json --now 2026-09-23T00:00:00Z > "$RUNNER_TEMP/core.json"
