@@ -1,0 +1,106 @@
+name: Evidence Gate OCI pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PRODUCER_SHA: 6d533cd9a6a25a4b1cb06eefceff376551686a4b
+  CORE_SHA: da0b697da6b55d14db13fafec7538c83a314b035
+  TRIVY_VERSION: 0.74.0
+  TRIVY_ARCHIVE_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+  TRIVY_EXECUTABLE_SHA256: d89bcc6510a267f11b773398cbf1be5520ce39f9e8b6633178c4487f05b7d791
+  OCI_REF: ghcr.io/github/github-mcp-server@sha256:a44e77b9c9003ed0e228716d118aa4ce9f3418dce30fe2340c71553164bd96f0
+  OCI_INDEX_DIGEST: sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Fetch pinned Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/trivy.tar.gz" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_ARCHIVE_SHA256}  $RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP"
+          echo "${TRIVY_EXECUTABLE_SHA256}  $RUNNER_TEMP/trivy" | sha256sum --check --strict
+          test "$("$RUNNER_TEMP/trivy" --version | sed -n 's/^Version: //p')" = "$TRIVY_VERSION"
+      - name: Fetch immutable Producer and Core
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/Xander-Xai/mcp-evidence-producer-trivy.git "$RUNNER_TEMP/producer"
+          git -C "$RUNNER_TEMP/producer" checkout --detach "$PRODUCER_SHA"
+          test "$(git -C "$RUNNER_TEMP/producer" rev-parse HEAD)" = "$PRODUCER_SHA"
+          git clone https://github.com/Xander-Xai/mcp-evidence-gate.git "$RUNNER_TEMP/core"
+          git -C "$RUNNER_TEMP/core" checkout --detach "$CORE_SHA"
+          test "$(git -C "$RUNNER_TEMP/core" rev-parse HEAD)" = "$CORE_SHA"
+          corepack enable
+          pnpm --dir "$RUNNER_TEMP/core" install --frozen-lockfile
+          pnpm --dir "$RUNNER_TEMP/core" build
+      - name: Run exact OCI, reproducibility, and tamper cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/oci-out" "$RUNNER_TEMP/oci-out-repeat"
+          (cd "$RUNNER_TEMP/producer" && python -m src.oci_producer --trivy "$RUNNER_TEMP/trivy" --image "$OCI_REF" --platform-os linux --platform-arch amd64 --out "$RUNNER_TEMP/oci-out")
+          (cd "$RUNNER_TEMP/producer" && python -m src.oci_producer --trivy "$RUNNER_TEMP/trivy" --image "$OCI_REF" --platform-os linux --platform-arch amd64 --out "$RUNNER_TEMP/oci-out-repeat")
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          a=Path(os.environ['RUNNER_TEMP'])/'oci-out'; b=Path(os.environ['RUNNER_TEMP'])/'oci-out-repeat'
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          ia=json.loads((a/'oci-identity.json').read_text()); ib=json.loads((b/'oci-identity.json').read_text())
+          assert ia['root']['digest']==os.environ['OCI_INDEX_DIGEST']
+          assert ia['selected']['platform']=={'os':'linux','architecture':'amd64'}
+          assert ia['selected']['manifest_digest']==ib['selected']['manifest_digest']
+          assert sha(a/'oci.manifest.json')==sha(b/'oci.manifest.json')
+          assert json.loads((a/'evidence.json').read_text())['scanner_execution']['completeness_status']=='complete'
+          json.dump({'artifact':os.environ['OCI_REF'],'index_digest':ia['root']['digest'],'platform_manifest_digest':ia['selected']['manifest_digest'],'platform':ia['selected']['platform'],'manifest_sha256':sha(a/'oci.manifest.json'),'reproducible':True},open(Path(os.environ['RUNNER_TEMP'])/'pilot-summary.json','w'),indent=2)
+          PY
+          set +e
+          node "$RUNNER_TEMP/core/dist/cli.js" verify --receipt "$RUNNER_TEMP/oci-out/receipt.json" --artifact "$RUNNER_TEMP/oci-out/oci.manifest.json" --evidence "$RUNNER_TEMP/oci-out/evidence.json" --policy strict-scanner-completeness --format json --now 2026-09-23T00:00:00Z > "$RUNNER_TEMP/core.json"
+          exact_code=$?
+          cp "$RUNNER_TEMP/oci-out/oci.manifest.json" "$RUNNER_TEMP/tampered-manifest.json"
+          printf '\n' >> "$RUNNER_TEMP/tampered-manifest.json"
+          node "$RUNNER_TEMP/core/dist/cli.js" verify --receipt "$RUNNER_TEMP/oci-out/receipt.json" --artifact "$RUNNER_TEMP/tampered-manifest.json" --evidence "$RUNNER_TEMP/oci-out/evidence.json" --policy strict-scanner-completeness --format json --now 2026-09-23T00:00:00Z > "$RUNNER_TEMP/core-tampered.json"
+          tamper_code=$?
+          set -e
+          python - "$RUNNER_TEMP/core.json" "$RUNNER_TEMP/core-tampered.json" "$exact_code" "$tamper_code" <<'PY'
+          import json,sys
+          exact=json.load(open(sys.argv[1])); tamper=json.load(open(sys.argv[2]))
+          assert int(sys.argv[3]) in (0,1)
+          assert int(sys.argv[4]) != 0
+          reasons=tamper.get('reason_codes',[])
+          assert 'artifact_digest_mismatch' in reasons or tamper.get('decision')!='pass'
+          json.dump({'exact':exact,'tampered':tamper},open(sys.argv[1].replace('core.json','acceptance.json'),'w'),indent=2)
+          PY
+      - name: Upload OCI pilot evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wave3-1-oci-github-mcp-${{ github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/pilot-summary.json
+            ${{ runner.temp }}/core.json
+            ${{ runner.temp }}/core-tampered.json
+            ${{ runner.temp }}/acceptance.json
+            ${{ runner.temp }}/oci-out/oci-identity.json
+            ${{ runner.temp }}/oci-out/oci.index.json
+            ${{ runner.temp }}/oci-out/oci.manifest.json
+            ${{ runner.temp }}/oci-out/receipt.json
+            ${{ runner.temp }}/oci-out/evidence.json
+            ${{ runner.temp }}/oci-out/trivy.raw.json
+            ${{ runner.temp }}/oci-out/trivy.stderr.log
