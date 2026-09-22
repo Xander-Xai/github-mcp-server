@@ -48,7 +48,6 @@ jobs:
           git clone https://github.com/Xander-Xai/mcp-evidence-gate.git "$RUNNER_TEMP/core"
           git -C "$RUNNER_TEMP/core" checkout --detach "$CORE_SHA"
           test "$(git -C "$RUNNER_TEMP/core" rev-parse HEAD)" = "$CORE_SHA"
-          corepack enable
           pnpm --dir "$RUNNER_TEMP/core" install --frozen-lockfile
           pnpm --dir "$RUNNER_TEMP/core" build
       - name: Run exact OCI, reproducibility, and tamper cases
